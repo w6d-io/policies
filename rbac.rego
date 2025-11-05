@@ -1,54 +1,36 @@
 package app.rbac
 
 default allow = false
-default roles_for_user = []
 
-# ---- locate maps regardless of nesting ----
-roles_map := m { m := data.roles.roles } else { m := data.roles }
-bindings_map := m { m := data.bindings.bindings } else { m := data.bindings }
-users_map := um { um := bindings_map.users } else { um := bindings_map }
-routes_map := rm { rm := data.routes.routes } else { rm := data.routes }
-
-# ---- roles_for_user (array) ----
-roles_for_user := rs {
-  email := lower(input.email)
-  um := users_map
-  rs := um[email]
+# Check if the input.action is in a list
+action_in(list, a) {
+  list[_] == a
 }
 
-# ---- method match (ANY) ----
-method_matches(m, methods) { methods[_] == "ANY" }
-method_matches(m, methods) { lower(methods[_]) == lower(m) }
+# User has role either directly or via groups
+user_has_role(role) {
+  data.app.rbac.user_roles[input.sub][role]
+} else {
+  some g
+  g := input.groups[_]
+  data.app.rbac.group_roles[g][role]
+}
 
-# ---- allow via wildcard ----
+# Permission match for a role:
+# - app equals input.app
+# - object regex matches input.object (e.g. "^/api/projects/[^/]+$")
+# - action is allowed
+role_allows(role) {
+  some p
+  p := data.app.rbac.role_permissions[role][_]
+  p.app == input.app
+  regex.match(p.object_re, input.object)
+  action_in(p.actions, input.action)
+}
+
 allow {
-  rm := roles_map
-  rtm := routes_map
-  um := users_map
-  email := lower(input.email)
-
-  r := rtm[input.app][_]
-  re_match(r.pattern, input.object)
-  method_matches(input.action, r.methods)
-
-  role := um[email][_]
-  p := rm[role][_]
-  p == "*"
+  some r
+  user_has_role(r)
+  role_allows(r)
 }
 
-# ---- allow via exact match ----
-allow {
-  rm := roles_map
-  rtm := routes_map
-  um := users_map
-  email := lower(input.email)
-
-  r := rtm[input.app][_]
-  re_match(r.pattern, input.object)
-  method_matches(input.action, r.methods)
-  req := r.perms[_]
-
-  role := um[email][_]
-  p := rm[role][_]
-  p == req
-}
