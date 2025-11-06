@@ -1,80 +1,92 @@
 package app.rbac
 
-default allow = false
+default allow := false
 
-# ---- helpers ----
-norm_method(m) = upper(m)
+#####################
+# Helpers
+#####################
 
-norm_path(p) = out {
-  p == "/"
-  out := "/"
-} else = out {
-  endswith(p, "/")
-  out := trim_suffix(p, "/")
-} else = p
+norm_method(m) := upper(m)
 
-# Convert express-like paths (":id", optional trailing slash, simple wildcard ":any*") to regex
-path_to_regex(path) = re {
-  base := regex.replace(`([.+?^${}()|\[\]\\\\])`, path, `\\$1`)
-  with_params := regex.replace(`:([^/*]+)\\*?`, base, `[^/]+`)
-  # handle a trailing :param* (our simple splat)
-  with_splat := regex.replace(`\\[\\^/\\]\\+\\$`, with_params, `.*`)
-  re := "^" + with_splat + "/?$"
+# Normalize path
+norm_path(p) := "/" if p == "/"
+norm_path(p) := trim_suffix(p, "/") if { p != "/"; endswith(p, "/") }
+norm_path(p) := p if { p != "/"; not endswith(p, "/") }
+
+# Convert express-like paths to regex
+path_to_regex(path) := re if {
+  tmp1 := regex.replace(`:([A-Za-z0-9_]+)\*`, path, `.*`)
+  tmp2 := regex.replace(`:([A-Za-z0-9_]+)`,     tmp1, `[^/]+`)
+  re   := sprintf("^%s/?$", [tmp2])
 }
 
-# ---- required perms from route_map only ----
-required_perms := perms {
+#################################
+# Route matching
+#################################
+
+# Is there a PUBLIC route that matches this request?
+public_match := true if {
   svc := input.app
-  some i
-  rm := data.route_map[svc].rules[i]
-  regex.match(path_to_regex(rm.path), norm_path(input.object))
+  # Find the rules for the "jinbe" app
+  some rm in data.route_map[svc].rules
+  
+  # Check if the method matches (e.g., "GET" == "GET")
   rm.method == norm_method(input.action)
-  perms := (rm.permission == null) ? [] : [rm.permission]
+  
+  # Check if the path matches (e.g., "/docs" matches regex "^/docs/?$")
+  regex.match(path_to_regex(rm.path), norm_path(input.object))
+  
+  # Check if it's public
+  rm.permission == null
 }
 
-# ---- role resolution: email-only (and optional id) ----
-email_roles := rs {
-  input.email != ""
-  rs := data.bindings.emails[input.email]
-} else := [] { true }
+#############
+# Decisions
+#############
 
-user_roles_direct := rs {
-  rs := data.bindings.users[input.sub]
-} else := [] { true }
+# 1) Allow if it's a public route
+allow if public_match
 
-effective_roles := roles {
-  roles := array.concat(email_roles, user_roles_direct)
+
+###############################################################
+# DEBUGGING RULESET
+#
+# To debug, run the command in the chat.
+#
+###############################################################
+
+# --- Step 1: Check input variables ---
+debug_input := {
+    "app": input.app,
+    "norm_method": norm_method(input.action),
+    "norm_path": norm_path(input.object),
 }
 
-role_perms(role) = perms { perms := data.roles.roles[role] }
+# --- Step 2: Check matching routes ---
+# Find all rules that match the app, method, and path
+matching_rules := [rm |
+    svc := input.app;
+    some rm in data.route_map[svc].rules;
+    rm.method == norm_method(input.action);
+    regex.match(path_to_regex(rm.path), norm_path(input.object))
+]
 
-has_perm(p) {
-  some r
-  r := effective_roles[_]
-  role_perms(r)[_] == "*"
-} else {
-  some r
-  r := effective_roles[_]
-  role_perms(r)[_] == p
+# --- Step 3: Check if any matching rule is public ---
+is_public_match if {
+    count(matching_rules) > 0
+    some r in matching_rules
+    r.permission == null
 }
 
-# ---- decision ----
-allow { required_perms == [] }
-allow {
-  some p
-  required_perms[_] == p
-  has_perm(p)
+# --- Final Debug Output ---
+debug_output := {
+    "__NOTE__": "Query this variable (debug_output) to see trace",
+    "0_input": debug_input,
+    "1_matching_rules_found": matching_rules,
+    "2_is_public_match_variable": is_public_match,
+    "3_public_match_variable": public_match,
+    "FINAL_DECISION_allow": allow
 }
 
-# Optional debug
-decision = {
-  "email": input.email,
-  "sub": input.sub,
-  "app": input.app,
-  "method": norm_method(input.action),
-  "path": norm_path(input.object),
-  "required_perms": required_perms,
-  "effective_roles": effective_roles,
-  "allowed": allow
-}
+
 
