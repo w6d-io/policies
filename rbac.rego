@@ -1,84 +1,102 @@
-package app.rbac
+package opal
 
-import rego.v1
+default allow = false
 
-import future.keywords.if
-
-default allow := false
-
-user_roles contains role if {
-	# From direct email bindings
-	roles := data.bindings.emails[input.email]
-	role := roles[_]
+# Check if user is admin
+is_admin {
+    roles = data.bindings.emails[input.email]
+    roles[_] = "admin"
 }
 
-user_roles contains role if {
-	# From group memberships
-	email := input.email
-	groups := data.bindings.group_membership[email]
-	group := groups[_]
-	roles := data.bindings.groups[group]
-	role := roles[_]
+is_admin {
+    groups = data.bindings.group_membership[input.email]
+    group = groups[_]
+    roles = data.bindings.groups[group]
+    roles[_] = "admin"
 }
 
-# Admin role has wildcard access
-is_admin if {
-  user_roles["admin"]
+# Check if route is public
+is_public_route {
+    route_config = data.route_map[input.app]
+    rule = route_config.rules[_]
+    rule.method = input.action
+    rule.path = input.object
+    rule.permission = null
 }
 
-# Set of matching route rules
-matching_rule contains rule if {
-	project := input.app
-	route_config := data.route_map[project]
-	rule := route_config.rules[_]
-	rule.method == input.action
-	path_matches(rule.path, input.object)
+is_public_route {
+    route_config = data.route_map[input.app]
+    rule = route_config.rules[_]
+    rule.method = input.action
+    contains(rule.path, ":any*")
+    prefix = trim_suffix(rule.path, ":any*")
+    startswith(input.object, prefix)
+    rule.permission = null
 }
 
-# Path matching (exact)rule
-path_matches(pattern, request_path) if {
-	pattern == request_path
+# Check if user has permission for route
+has_route_permission {
+    route_config = data.route_map[input.app]
+    rule = route_config.rules[_]
+    rule.method = input.action
+    rule.path = input.object
+    rule.permission != null
+    user_has_permission(rule.permission)
 }
 
-# Path matching (:any* suffix wildcard)
-path_matches(pattern, request_path) if {
-	contains(pattern, ":any*")
-	prefix := trim_suffix(pattern, ":any*")
-	startswith(request_path, prefix)
+has_route_permission {
+    route_config = data.route_map[input.app]
+    rule = route_config.rules[_]
+    rule.method = input.action
+    contains(rule.path, ":any*")
+    prefix = trim_suffix(rule.path, ":any*")
+    startswith(input.object, prefix)
+    rule.permission != null
+    user_has_permission(rule.permission)
 }
 
-# Main authorization logic
-
-# Admin can do everything
-allow if {
-	is_admin
+# Check if user has specific permission
+user_has_permission(_) {
+    roles = data.bindings.emails[input.email]
+    role = roles[_]
+    perms = data.roles[role]
+    perms[_] = "*"
 }
 
-# Route requires no permission
-allow if {
-	rule := matching_rule[_]
-	rule.permission == null
+user_has_permission(permission) {
+    roles = data.bindings.emails[input.email]
+    role = roles[_]
+    perms = data.roles[role]
+    perms[_] = permission
 }
 
-# Route requires a permission; user must have it
-allow if {
-	rule := matching_rule[_]
-	rule.permission != null
-	user_has_permission(rule.permission)
+user_has_permission(_) {
+    groups = data.bindings.group_membership[input.email]
+    group = groups[_]
+    roles = data.bindings.groups[group]
+    role = roles[_]
+    perms = data.roles[role]
+    perms[_] = "*"
 }
 
-# Permission checks
-user_has_permission(_) if {
-	role := user_roles[_]
-	perms := data.roles[role]
-	perm := perms[_]
-	perm == "*"
+user_has_permission(permission) {
+    groups = data.bindings.group_membership[input.email]
+    group = groups[_]
+    roles = data.bindings.groups[group]
+    role = roles[_]
+    perms = data.roles[role]
+    perms[_] = permission
 }
 
-user_has_permission(permission) if {
-	role := user_roles[_]
-	perms := data.roles[role]
-	perm := perms[_]
-	permission == perm
+# Final allow rule
+allow {
+    is_admin
 }
 
+allow {
+    is_public_route
+}
+
+allow {
+    has_route_permission
+}
