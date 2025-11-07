@@ -1,5 +1,7 @@
 package app.rbac
 
+import rego.v1
+
 import future.keywords.if
 
 default allow := false
