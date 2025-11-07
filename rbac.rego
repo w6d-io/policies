@@ -19,7 +19,7 @@ user_roles contains role if {
 
 # Admin role has wildcard access
 is_admin if {
-	"admin" in user_roles
+  user_roles["admin"]
 }
 
 # Set of matching route rules
