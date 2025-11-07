@@ -1,5 +1,4 @@
 package opal
-import future.keywords.in
 
 default allow := false
 
@@ -65,4 +64,3 @@ user_has_permission(permission) if {
 	perm := perms[_]
 	permission == perm
 }
-
