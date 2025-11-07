@@ -4,13 +4,15 @@ default allow := false
 
 user_roles contains role if {
 	# From direct email bindings
-	some role in data.bindings.emails[input.email]
+	roles := data.bindings.emails[input.email]
+	role := roles[_]
 }
 
 user_roles contains role if {
 	# From group memberships
 	email := input.email
-	some group in data.bindings.group_membership[email]
+	groups := data.bindings.group_membership[email]
+	group := groups[_]
 	some role in data.bindings.groups[group]
 }
 
@@ -64,12 +66,14 @@ allow if {
 user_has_permission(_) if {
 	some role in user_roles
 	perms := data.roles[role]
-	"*" in perms
+	perm := perms[_]
+	perm == "*"
 }
 
 user_has_permission(permission) if {
 	some role in user_roles
 	perms := data.roles[role]
-	permission in perms
+	perm := perms[_]
+	permission == perm
 }
 
