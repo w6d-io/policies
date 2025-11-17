@@ -1,203 +1,99 @@
-### Rego rules for Opal RBAC authorization
-
-# DATA set
-
-# {
-#     "bindings": {
-#         "emails": {
-#             "admin@w6d.io": [
-#                 "admin"
-#             ],
-#             "bash62@protonmail.com": [
-#                 "developer"
-#             ]
-#         },
-#         "group_membership": {
-#             "bash62@protonmail.com": [
-#                 "engineering"
-#             ]
-#         },
-#         "groups": {
-#             "engineering": [
-#                 "dev"
-#             ]
-#         }
-#     },
-#     "roles": {
-#         "admin": [
-#             "*"
-#         ],
-#         "dev": [
-#             "docs:read"
-#         ],
-#         "developer": [
-#             "docs:read"
-#         ]
-#     },
-#     "route_map": {
-#         "jinbe": {
-#             "rules": [
-#                 {
-#                     "method": "GET",
-#                     "path": "/docs",
-#                     "permission": "docs:read"
-#                 },
-#                 {
-#                     "method": "GET",
-#                     "path": "/public/:any*",
-#                     "permission": null
-#                 },
-#                 {
-#                     "method": "POST",
-#                     "path": "/admin",
-#                     "permission": "admin:write"
-#                 }
-#             ]
-#         }
-#     }
-# }
-
-
-# INPUTS TEST
-# {
-#     "input": {
-#         "action": "GET",
-#         "app": "jinbe",
-#         "email": "admin@w6d.io",
-#         "object": "/docs",
-#         "sub": "2272ecf1-cfb7-4198-8495-c498323e9c1f"
-#     }
-# }
-
-# {
-#     "input": {
-#         "action": "GET",
-#         "app": "jinbe",
-#         "email": "bash62@protonmail.com",
-#         "object": "/docs",
-#         "sub": "2272ecf1-cfb7-4198-8495-c498323e9c1f"
-#     }
-# }
-
-
-
 package opal
+
+
+
+bar contains path if {
+
+	path := data.route_map["jinbe"]["rules"]
+
+}
+
+
 
 default allow = false
 
-# Debug: Check if email exists in bindings
-debug_email_exists = true if {
-    data.bindings.emails[input.email]
-}
-
-
-
-# Allow if user exist
-
-
-
-
-debug_direct_roles = roles if {
-    roles = data.bindings.emails[input.email]
-}
-
-# Debug: Check group membership
-debug_user_groups = groups if {
-    groups = data.bindings.group_membership[input.email]
-}
-
-# Debug: Check group roles
-debug_group_roles = roles if {
-    groups = data.bindings.group_membership[input.email]
-    group = groups[_]
-    roles = data.bindings.groups[group]
-}
-
-# Debug: Check route map
-debug_route_map = routes if {
-    routes = data.route_map[input.app].rules
-}
-
-# Debug: Check path matching
-debug_path_match = result if {
-    pattern = "/public/:any*"
-    request_path = "/public/zefz"
-    contains(pattern, ":any*")
-    prefix = trim_suffix(pattern, ":any*")
-    result = startswith(request_path, prefix)
-}
-
-# Get all user roles efficiently
+# --- 1. USER ROLE AGGREGATION ---
+# Get all roles assigned to the user, either directly or via groups.
+# This logic is preserved from the original policy, as it is correct.
 user_roles contains role if {
     # From direct email bindings
-    roles = data.bindings.emails[input.email]
-    role = roles[_]
+    roles := data.bindings.emails[input.email]
+    role := roles[_]
 }
 
 user_roles contains role if {
     # From group memberships
-    groups = data.bindings.group_membership[input.email]
-    group = groups[_]
-    roles = data.bindings.groups[group]
-    role = roles[_]
+    groups := data.bindings.group_membership[input.email]
+    group := groups[_]
+    roles := data.bindings.groups[group]
+    role := roles[_]
 }
 
-# Check if user is admin
-is_admin if {
-    "admin" = user_roles[_]
+# --- 2. USER PERMISSION AGGREGATION (NEW) ---
+# This is the core optimization. We pre-compute the *entire set*
+# of permissions the user has from all their roles.
+user_permissions contains perm if {
+    # Get one of the user's roles
+    role := user_roles[_]
+    # Get the list of permissions for that role
+    perms := data.roles[role]
+    # Iterate that list
+    perm := perms[_]
 }
 
-# Find matching route rules
+# --- 3. REQUEST ROUTE MATCHING ---
+# Find all rules in the route map that match the incoming request.
+# This logic is preserved from the original policy.
 matching_rules contains rule if {
-    route_config = data.route_map[input.app]
-    rule = route_config.rules[_]
+    route_config := data.route_map[input.app]
+    rule := route_config.rules[_]
     rule.method = input.action
     path_matches(rule.path, input.object)
 }
 
-# Path matching (exact)
+# Helper function for path matching (exact).
 path_matches(pattern, request_path) if {
     pattern = request_path
 }
 
-# Path matching (:any* suffix wildcard)
+# Helper function for path matching (:any* suffix wildcard).
 path_matches(pattern, request_path) if {
     contains(pattern, ":any*")
-    prefix = trim_suffix(pattern, ":any*")
+    prefix := trim_suffix(pattern, ":any*")
     startswith(request_path, prefix)
 }
 
-# Check if user has specific permission
-has_permission(_) if {
-    role = user_roles[_]
-    perms = data.roles[role]
-    perm = perms[_]
-    perm = "*"
+# --- 4. UNIFIED PERMISSION CHECK (NEW & REPLACES FLAWED LOGIC) ---
+# This single helper rule replaces both `is_admin` and `has_permission`.
+# It elegantly handles exact permissions AND wildcard permissions.
+
+# Case 1: Allow if the user has the *exact* permission required.
+user_has_permission(permission) if {
+    # Check if the required 'permission' exists in the set we built.
+    user_permissions[permission]
 }
 
-has_permission(permission) if {
-    role = user_roles[_]
-    perms = data.roles[role]
-    perm = perms[_]
-    permission = perm
+# Case 2: Allow if the user has the global wildcard permission.
+user_has_permission(_) if {
+    # Check if the '*' permission exists in the set we built.
+    user_permissions["*"]
 }
 
-# Main authorization logic
+# --- 5. CONSOLIDATED ALLOW LOGIC (OPTIMIZED) ---
+# The main allow logic is now simple, clean, and unified.
+# The special `is_admin` check is no longer needed.
 
-# Admin can do everything
+# Rule 1: Allow requests for public routes (no permission defined).
 allow if {
-    is_admin
-}
-
-# Public routes (no permission required)
-allow if {
-    rule = matching_rules[_]
+    rule := matching_rules[_]
     rule.permission = null
 }
 
-# Permission-protected routes
+# Rule 2: Allow requests for protected routes if user has permission.
 allow if {
-    rule = matching_rules[_]
-    rule.permission != null
-    has_permission(rule.permission)
+    rule := matching_rules[_]
+    required_perm := rule.permission
+    # This single call now correctly checks both admins and regular users
+    # thanks to the unified `user_has_permission` helper.
+    user_has_permission(required_perm)
 }
