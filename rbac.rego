@@ -5,13 +5,13 @@ default allow = false
 # --- 1. USER ROLE AGGREGATION ---
 user_roles contains role if {
     # From direct email bindings
-    roles := data.bindings.emails[input.email]
+    roles := data.bindings.emails[input.input.email]
     role := roles[_]
 }
 
 user_roles contains role if {
     # From group memberships
-    groups := data.bindings.group_membership[input.email]
+    groups := data.bindings.group_membership[input.input.email]
     group := groups[_]
     roles := data.bindings.groups[group]
     role := roles[_]
@@ -26,10 +26,10 @@ user_permissions contains perm if {
 
 # --- 3. REQUEST ROUTE MATCHING ---
 matching_rules contains rule if {
-    route_config := data.route_map[input.app]
+    route_config := data.route_map[input.input.app]
     rule := route_config.rules[_]
-    rule.method = input.action
-    path_matches(rule.path, input.object)
+    rule.method = input.input.action
+    path_matches(rule.path, input.input.object)
 }
 
 # Helper function for path matching (exact).
