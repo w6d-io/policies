@@ -1,93 +1,203 @@
+### Rego rules for Opal RBAC authorization
+
+# DATA set
+
+# {
+#     "bindings": {
+#         "emails": {
+#             "admin@w6d.io": [
+#                 "admin"
+#             ],
+#             "bash62@protonmail.com": [
+#                 "developer"
+#             ]
+#         },
+#         "group_membership": {
+#             "bash62@protonmail.com": [
+#                 "engineering"
+#             ]
+#         },
+#         "groups": {
+#             "engineering": [
+#                 "dev"
+#             ]
+#         }
+#     },
+#     "roles": {
+#         "admin": [
+#             "*"
+#         ],
+#         "dev": [
+#             "docs:read"
+#         ],
+#         "developer": [
+#             "docs:read"
+#         ]
+#     },
+#     "route_map": {
+#         "jinbe": {
+#             "rules": [
+#                 {
+#                     "method": "GET",
+#                     "path": "/docs",
+#                     "permission": "docs:read"
+#                 },
+#                 {
+#                     "method": "GET",
+#                     "path": "/public/:any*",
+#                     "permission": null
+#                 },
+#                 {
+#                     "method": "POST",
+#                     "path": "/admin",
+#                     "permission": "admin:write"
+#                 }
+#             ]
+#         }
+#     }
+# }
+
+
+# INPUTS TEST
+# {
+#     "input": {
+#         "action": "GET",
+#         "app": "jinbe",
+#         "email": "admin@w6d.io",
+#         "object": "/docs",
+#         "sub": "2272ecf1-cfb7-4198-8495-c498323e9c1f"
+#     }
+# }
+
+# {
+#     "input": {
+#         "action": "GET",
+#         "app": "jinbe",
+#         "email": "bash62@protonmail.com",
+#         "object": "/docs",
+#         "sub": "2272ecf1-cfb7-4198-8495-c498323e9c1f"
+#     }
+# }
+
+
+
 package opal
 
 default allow = false
 
-# -------- helpers
-path_matches_exact(rule) {
-  rule.path == input.object
+# Debug: Check if email exists in bindings
+debug_email_exists = true if {
+    data.bindings.emails[input.email]
 }
 
-path_matches_prefix(rule) {
-  contains(rule.path, ":any*")
-  prefix := trim_suffix(rule.path, ":any*")
-  startswith(input.object, prefix)
+
+
+# Allow if user exist
+
+
+
+
+debug_direct_roles = roles if {
+    roles = data.bindings.emails[input.email]
 }
 
-method_matches(rule) {
-  upper(rule.method) == upper(input.action)
+# Debug: Check group membership
+debug_user_groups = groups if {
+    groups = data.bindings.group_membership[input.email]
 }
 
-some_rule := route_config.rules[_] {
-  route_config := data.route_map[input.app]
+# Debug: Check group roles
+debug_group_roles = roles if {
+    groups = data.bindings.group_membership[input.email]
+    group = groups[_]
+    roles = data.bindings.groups[group]
 }
 
-# -------- role/perm lookup (same as yours, just grouped)
-is_admin {
-  roles := data.bindings.emails[input.email]
-  roles[_] == "admin"
-}
-is_admin {
-  groups := data.bindings.group_membership[input.email]
-  g := groups[_]
-  roles := data.bindings.groups[g]
-  roles[_] == "admin"
+# Debug: Check route map
+debug_route_map = routes if {
+    routes = data.route_map[input.app].rules
 }
 
-user_has_permission(_) {
-  roles := data.bindings.emails[input.email]
-  r := roles[_]
-  perms := data.roles[r]
-  perms[_] == "*"
-}
-user_has_permission(p) {
-  roles := data.bindings.emails[input.email]
-  r := roles[_]
-  perms := data.roles[r]
-  perms[_] == p
-}
-user_has_permission(_) {
-  groups := data.bindings.group_membership[input.email]
-  g := groups[_]
-  roles := data.bindings.groups[g]
-  r := roles[_]
-  perms := data.roles[r]
-  perms[_] == "*"
-}
-user_has_permission(p) {
-  groups := data.bindings.group_membership[input.email]
-  g := groups[_]
-  roles := data.bindings.groups[g]
-  r := roles[_]
-  perms := data.roles[r]
-  perms[_] == p
+# Debug: Check path matching
+debug_path_match = result if {
+    pattern = "/public/:any*"
+    request_path = "/public/zefz"
+    contains(pattern, ":any*")
+    prefix = trim_suffix(pattern, ":any*")
+    result = startswith(request_path, prefix)
 }
 
-# -------- route eval
-is_public_route {
-  some_rule
-  method_matches(some_rule)
-  (path_matches_exact(some_rule) or path_matches_prefix(some_rule))
-  some_rule.permission == null
+# Get all user roles efficiently
+user_roles contains role if {
+    # From direct email bindings
+    roles = data.bindings.emails[input.email]
+    role = roles[_]
 }
 
-has_route_permission {
-  some_rule
-  method_matches(some_rule)
-  (path_matches_exact(some_rule) or path_matches_prefix(some_rule))
-  some_rule.permission != null
-  user_has_permission(some_rule.permission)
+user_roles contains role if {
+    # From group memberships
+    groups = data.bindings.group_membership[input.email]
+    group = groups[_]
+    roles = data.bindings.groups[group]
+    role = roles[_]
 }
 
-# -------- final decision
-allow { is_admin }
-allow { has_route_permission }
-allow { is_public_route }
-
-# -------- debug endpoint (query /v1/data/opal/why)
-why := {
-  "is_admin": is_admin,
-  "is_public_route": is_public_route,
-  "has_route_permission": has_route_permission,
-  "input": input,
+# Check if user is admin
+is_admin if {
+    "admin" = user_roles[_]
 }
 
+# Find matching route rules
+matching_rules contains rule if {
+    route_config = data.route_map[input.app]
+    rule = route_config.rules[_]
+    rule.method = input.action
+    path_matches(rule.path, input.object)
+}
+
+# Path matching (exact)
+path_matches(pattern, request_path) if {
+    pattern = request_path
+}
+
+# Path matching (:any* suffix wildcard)
+path_matches(pattern, request_path) if {
+    contains(pattern, ":any*")
+    prefix = trim_suffix(pattern, ":any*")
+    startswith(request_path, prefix)
+}
+
+# Check if user has specific permission
+has_permission(_) if {
+    role = user_roles[_]
+    perms = data.roles[role]
+    perm = perms[_]
+    perm = "*"
+}
+
+has_permission(permission) if {
+    role = user_roles[_]
+    perms = data.roles[role]
+    perm = perms[_]
+    permission = perm
+}
+
+# Main authorization logic
+
+# Admin can do everything
+allow if {
+    is_admin
+}
+
+# Public routes (no permission required)
+allow if {
+    rule = matching_rules[_]
+    rule.permission = null
+}
+
+# Permission-protected routes
+allow if {
+    rule = matching_rules[_]
+    rule.permission != null
+    has_permission(rule.permission)
+}
