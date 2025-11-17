@@ -3,13 +3,13 @@ package rbac
 default allow = false
 
 # --- 1. USER ROLE AGGREGATION ---
-user_roles contains role if {
+user_roles[role] if {
     # From direct email bindings
     roles := data.bindings.emails[input.input.email]
     role := roles[_]
 }
 
-user_roles contains role if {
+user_roles[role] if {
     # From group memberships
     groups := data.bindings.group_membership[input.input.email]
     group := groups[_]
@@ -18,14 +18,14 @@ user_roles contains role if {
 }
 
 # --- 2. USER PERMISSION AGGREGATION ---
-user_permissions contains perm if {
+user_permissions[perm] if {
     role := user_roles[_]
     perms := data.roles[role]
     perm := perms[_]
 }
 
 # --- 3. REQUEST ROUTE MATCHING ---
-matching_rules contains rule if {
+matching_rules[rule] if {
     route_config := data.route_map[input.input.app]
     rule := route_config.rules[_]
     rule.method = input.input.action
