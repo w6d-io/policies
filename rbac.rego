@@ -32,7 +32,7 @@ matching_rules[rule] {
     path_matches(rule.path, input.object)
 }
 
-# Helper function for path matching (exact)
+# Helper function for path matching (exact match)
 path_matches(pattern, request_path) {
     pattern == request_path
 }
@@ -42,6 +42,36 @@ path_matches(pattern, request_path) {
     contains(pattern, ":any*")
     prefix := trim_suffix(pattern, ":any*")
     startswith(request_path, prefix)
+}
+
+# Helper function for path matching with :param segments
+# Matches patterns like /api/clusters/:id against /api/clusters/abc123
+path_matches(pattern, request_path) {
+    contains(pattern, ":")
+    not contains(pattern, ":any*")
+    pattern_parts := split(pattern, "/")
+    path_parts := split(request_path, "/")
+    count(pattern_parts) == count(path_parts)
+    all_parts_match(pattern_parts, path_parts)
+}
+
+# Check all path segments match (either exact or :param wildcard)
+all_parts_match(pattern_parts, path_parts) {
+    count(pattern_parts) == count(path_parts)
+    every i, _ in pattern_parts {
+        part_matches(pattern_parts[i], path_parts[i])
+    }
+}
+
+# A segment matches if pattern starts with : (parameter placeholder)
+part_matches(pattern_part, path_part) {
+    startswith(pattern_part, ":")
+}
+
+# A segment matches if exact string match
+part_matches(pattern_part, path_part) {
+    not startswith(pattern_part, ":")
+    pattern_part == path_part
 }
 
 # --- 4. UNIFIED PERMISSION CHECK ---
