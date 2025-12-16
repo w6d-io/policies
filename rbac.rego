@@ -2,28 +2,56 @@ package rbac
 
 import future.keywords.every
 
-
 default allow = false
 
-# --- 1. USER ROLE AGGREGATION ---
-# From direct email bindings
-user_roles[role] {
-    roles := data.bindings.emails[input.email]
-    role := roles[_]
-}
+# --- 1. USER ROLE AGGREGATION (per service) ---
 
-# From group memberships
-user_roles[role] {
+# Get user's roles for the current app/service
+# From global roles (apply to all services)
+user_roles_for_app[role] {
     groups := data.bindings.group_membership[input.email]
     group := groups[_]
-    roles := data.bindings.groups[group]
-    role := roles[_]
+    group_roles := data.bindings.groups[group]
+    global_roles := group_roles["global"]
+    role := global_roles[_]
 }
 
-# --- 2. USER PERMISSION AGGREGATION ---
+# From service-specific roles
+user_roles_for_app[role] {
+    groups := data.bindings.group_membership[input.email]
+    group := groups[_]
+    group_roles := data.bindings.groups[group]
+    service_roles := group_roles[input.app]
+    role := service_roles[_]
+}
+
+# From direct email bindings (global)
+user_roles_for_app[role] {
+    email_roles := data.bindings.emails[input.email]
+    global_roles := email_roles["global"]
+    role := global_roles[_]
+}
+
+# From direct email bindings (service-specific)
+user_roles_for_app[role] {
+    email_roles := data.bindings.emails[input.email]
+    service_roles := email_roles[input.app]
+    role := service_roles[_]
+}
+
+# --- 2. USER PERMISSION AGGREGATION (per service) ---
+
+# Get permissions from global roles
 user_permissions[perm] {
-    role := user_roles[_]
-    perms := data.roles[role]
+    role := user_roles_for_app[_]
+    perms := data.roles.global[role]
+    perm := perms[_]
+}
+
+# Get permissions from service-specific roles
+user_permissions[perm] {
+    role := user_roles_for_app[_]
+    perms := data.roles[input.app][role]
     perm := perms[_]
 }
 
@@ -48,7 +76,6 @@ path_matches(pattern, request_path) {
 }
 
 # Helper function for path matching with :param segments
-# Matches patterns like /api/clusters/:id against /api/clusters/abc123
 path_matches(pattern, request_path) {
     contains(pattern, ":")
     not contains(pattern, ":any*")
@@ -82,34 +109,74 @@ user_has_permission(permission) {
     user_permissions[permission]
 }
 
+# Wildcard permission (admin has all)
 user_has_permission(_) {
     user_permissions["*"]
 }
 
 # --- 5. USER INFO ENDPOINT ---
-# Returns user's resolved roles and permissions for /api/whoami
+# Returns user's resolved roles and permissions for the current app
+# Call with: POST /v1/data/rbac/user_info {"input": {"email": "...", "app": "jinbe"}}
+
 user_info = info {
+    data.bindings.group_membership[input.email]
     info := {
         "email": input.email,
+        "app": input.app,
         "groups": data.bindings.group_membership[input.email],
-        "roles": user_roles,
+        "roles": user_roles_for_app,
         "permissions": user_permissions
     }
 }
 
-# Fallback when user not found in bindings
+# Fallback when user not found
 user_info = info {
     not data.bindings.group_membership[input.email]
     not data.bindings.emails[input.email]
     info := {
         "email": input.email,
+        "app": input.app,
         "groups": [],
         "roles": set(),
         "permissions": set()
     }
 }
 
-# --- 6. CONSOLIDATED ALLOW LOGIC ---
+# --- 6. ALL APPS USER INFO ---
+# Returns user's roles across ALL services (useful for frontend)
+# Call with: POST /v1/data/rbac/user_info_all {"input": {"email": "..."}}
+
+user_roles_all_apps[app] = roles {
+    some app
+    data.roles[app]
+    roles := {role |
+        groups := data.bindings.group_membership[input.email]
+        group := groups[_]
+        group_roles := data.bindings.groups[group]
+        app_roles := group_roles[app]
+        role := app_roles[_]
+    }
+}
+
+user_info_all = info {
+    data.bindings.group_membership[input.email]
+    info := {
+        "email": input.email,
+        "groups": data.bindings.group_membership[input.email],
+        "roles_by_app": user_roles_all_apps
+    }
+}
+
+user_info_all = info {
+    not data.bindings.group_membership[input.email]
+    info := {
+        "email": input.email,
+        "groups": [],
+        "roles_by_app": {}
+    }
+}
+
+# --- 7. CONSOLIDATED ALLOW LOGIC ---
 # Allow if route has null permission (public)
 allow {
     rule := matching_rules[_]
