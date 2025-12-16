@@ -1,5 +1,8 @@
 package rbac
 
+import future.keywords.every
+
+
 default allow = false
 
 # --- 1. USER ROLE AGGREGATION ---
