@@ -83,7 +83,30 @@ user_has_permission(_) {
     user_permissions["*"]
 }
 
-# --- 5. CONSOLIDATED ALLOW LOGIC ---
+# --- 5. USER INFO ENDPOINT ---
+# Returns user's resolved roles and permissions for /api/whoami
+user_info = info {
+    info := {
+        "email": input.email,
+        "groups": data.bindings.group_membership[input.email],
+        "roles": user_roles,
+        "permissions": user_permissions
+    }
+}
+
+# Fallback when user not found in bindings
+user_info = info {
+    not data.bindings.group_membership[input.email]
+    not data.bindings.emails[input.email]
+    info := {
+        "email": input.email,
+        "groups": [],
+        "roles": set(),
+        "permissions": set()
+    }
+}
+
+# --- 6. CONSOLIDATED ALLOW LOGIC ---
 # Allow if route has null permission (public)
 allow {
     rule := matching_rules[_]
