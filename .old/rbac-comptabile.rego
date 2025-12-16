@@ -1,16 +1,16 @@
 package rbac
 
-default allow = false
+default allow := false
 
 # --- 1. USER ROLE AGGREGATION ---
-# From direct email bindings
 user_roles[role] {
+    # From direct email bindings
     roles := data.bindings.emails[input.email]
     role := roles[_]
 }
 
-# From group memberships
 user_roles[role] {
+    # From group memberships  
     groups := data.bindings.group_membership[input.email]
     group := groups[_]
     roles := data.bindings.groups[group]
@@ -28,16 +28,16 @@ user_permissions[perm] {
 matching_rules[rule] {
     route_config := data.route_map[input.app]
     rule := route_config.rules[_]
-    rule.method == input.action
+    rule.method = input.action
     path_matches(rule.path, input.object)
 }
 
-# Helper function for path matching (exact)
+# Helper function for path matching (exact).
 path_matches(pattern, request_path) {
-    pattern == request_path
+    pattern = request_path
 }
 
-# Helper function for path matching (:any* suffix wildcard)
+# Helper function for path matching (:any* suffix wildcard).
 path_matches(pattern, request_path) {
     contains(pattern, ":any*")
     prefix := trim_suffix(pattern, ":any*")
@@ -54,17 +54,13 @@ user_has_permission(_) {
 }
 
 # --- 5. CONSOLIDATED ALLOW LOGIC ---
-# Allow if route has null permission (public)
 allow {
     rule := matching_rules[_]
-    rule.permission == null
+    rule.permission = null
 }
 
-# Allow if user has required permission
 allow {
     rule := matching_rules[_]
     required_perm := rule.permission
-    required_perm != null
     user_has_permission(required_perm)
 }
-
