@@ -177,16 +177,14 @@ user_info_all = info {
 }
 
 # --- 7. CONSOLIDATED ALLOW LOGIC ---
-# Allow if route has null permission (public)
+# Allow if route has no permission requirement (public)
 allow {
     rule := matching_rules[_]
-    rule.permission == null
+    not rule.permission
 }
 
-# Allow if user has required permission
+# Allow if user has the required permission
 allow {
     rule := matching_rules[_]
-    required_perm := rule.permission
-    required_perm != null
-    user_has_permission(required_perm)
+    user_has_permission(rule.permission)
 }
