@@ -69,10 +69,16 @@ path_matches(pattern, request_path) {
 }
 
 # Helper function for path matching (:any* suffix wildcard)
+# Splits prefix into segments and matches :param placeholders before the wildcard tail
 path_matches(pattern, request_path) {
     contains(pattern, ":any*")
-    prefix := trim_suffix(pattern, ":any*")
-    startswith(request_path, prefix)
+    prefix_pattern := trim_suffix(pattern, ":any*")
+    prefix_parts := split(trim_suffix(prefix_pattern, "/"), "/")
+    path_parts := split(request_path, "/")
+    count(path_parts) >= count(prefix_parts)
+    every i, _ in prefix_parts {
+        part_matches(prefix_parts[i], path_parts[i])
+    }
 }
 
 # Helper function for path matching with :param segments
