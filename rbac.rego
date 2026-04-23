@@ -183,6 +183,11 @@ user_info_all = info {
 }
 
 # --- 7. CONSOLIDATED ALLOW LOGIC ---
+# Allow wildcard permission holders (super_admin) — bypass route matching
+allow {
+    user_permissions["*"]
+}
+
 # Allow if route has no permission requirement (public)
 allow {
     rule := matching_rules[_]
