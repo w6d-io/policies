@@ -125,6 +125,41 @@ user_info = info {
   }
 }
 
+# ─── SIMULATOR — single-query decision trace ───
+# Input: {email, app, action, object}
+# Output: {allow, matching_rules[], groups, roles, permissions, super_admin}
+#
+# Used by jinbe POST /api/admin/rbac/simulate to render a faithful
+# decision trace identical to what oathkeeper → opa would produce at
+# request time. Avoids JS-side reimplementation drift.
+
+matching_rules_array := [r |
+  r := data.route_map[input.app].rules[_]
+  r.method == input.action
+  path_matches(r.path, input.object)
+]
+
+# Super-admin holds "*" in any service context (matches `allow` rule above).
+super_admin {
+  some app
+  data.roles[app]
+  perms_for(app)["*"]
+}
+
+default super_admin = false
+
+simulate = result {
+  groups := object.get(data.bindings.group_membership, input.email, [])
+  result := {
+    "allow": allow,
+    "matching_rules": matching_rules_array,
+    "groups": groups,
+    "roles": roles_for(input.app),
+    "permissions": perms_for(input.app),
+    "super_admin": super_admin,
+  }
+}
+
 # ─── ALL-APPS USER INFO ───
 
 user_roles_all_apps[app] = roles {
