@@ -261,5 +261,23 @@ decision = result {
   result := {
     "allow": allow,
     "groups": groups,
+    "reason": decision_reason,
   }
+}
+
+# `not_found` distinguishes "path not declared in any service's route_map"
+# from "path declared but the caller lacks the permission". opa-authz-proxy
+# maps the two to 404 and 403 respectively so error-page renders the right
+# message — leaking a 403 for an unknown URL would tell unauthenticated
+# scanners which paths exist.
+default decision_reason = "ok"
+
+decision_reason = "not_found" {
+  not allow
+  count(matching_rules) == 0
+}
+
+decision_reason = "forbidden" {
+  not allow
+  count(matching_rules) > 0
 }
