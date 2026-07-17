@@ -1,6 +1,7 @@
 package rbac
 
 import future.keywords.every
+import future.keywords.in
 
 default allow = false
 
@@ -137,6 +138,47 @@ user_has_permission(_) {
   user_permissions["*"]
 }
 
+# ─── 5b. TENANT (ORGANIZATION) MEMBERSHIP CHECK ───
+#
+# Path 3 hybrid multi-org: `input.organization_id` is the org UUID the
+# SPA attached to the request (typically via the X-Tenant-Id header
+# that opa-authz-proxy promotes into the OPA input). When that field
+# is present, the user must be a member of the org to proceed —
+# either via the authoritative `metadata_admin.organizations` array
+# (mirrored to Redis as `data.bindings.user_organizations[email]`)
+# or via the legacy single-org pointer kept as a fallback for
+# pre-migration identities.
+#
+# When `input.organization_id` is absent, this gate passes (no
+# behaviour change vs the pre-multi-org rego). Super-admin bypasses
+# the gate entirely via the unchanged `allow { user_permissions["*"] }`
+# rule below.
+
+# Membership via the multi-org bindings (authoritative).
+user_in_org(email, org_id) {
+  org_id == data.bindings.user_organizations[email][_]
+}
+
+# Membership via the legacy single-org pointer, kept for backward
+# compatibility while tenants migrate from a single
+# `traits.organization_id` to the `metadata_admin.organizations`
+# array. Mirrored into Redis as
+# `data.bindings.user_organization_primary[email]`.
+user_in_org(email, org_id) {
+  org_id == data.bindings.user_organization_primary[email]
+}
+
+default tenant_ok = false
+
+tenant_ok {
+  not input.organization_id
+}
+
+tenant_ok {
+  input.organization_id
+  user_in_org(input.email, input.organization_id)
+}
+
 # ─── 6. USER INFO (simulator / direct OPA queries) ───
 
 user_info = info {
@@ -196,21 +238,30 @@ user_info_all = info {
 
 # ─── 8. ALLOW LOGIC ───
 
-# Super admin / wildcard: bypass route matching entirely
+# Super admin / wildcard: bypass route matching AND the tenant gate.
+# A wildcard permission means cross-tenant administration is part of
+# the role's contract — locking it inside one org would defeat the
+# point.
 allow {
   user_permissions["*"]
 }
 
-# Route has no permission requirement (public endpoint)
+# Route has no permission requirement (public endpoint). Still gated
+# on the tenant check so an unauthenticated public route on tenant A
+# cannot be reached with an X-Tenant-Id pointing at tenant B by a
+# user who isn't a member of B.
 allow {
   rule := matching_rules[_]
   not rule.permission
+  tenant_ok
 }
 
-# User holds the required permission
+# User holds the required permission AND (when an org context is
+# attached) is a member of the requested org.
 allow {
   rule := matching_rules[_]
   user_has_permission(rule.permission)
+  tenant_ok
 }
 
 # ─── SIMULATOR — single-query decision trace ───
@@ -258,18 +309,24 @@ simulate = result {
 
 decision = result {
   groups := object.get(data.bindings.group_membership, input.email, [])
+  organizations := object.get(data.bindings.user_organizations, input.email, [])
   result := {
     "allow": allow,
     "groups": groups,
+    "organizations": organizations,
     "reason": decision_reason,
   }
 }
 
 # `not_found` distinguishes "path not declared in any service's route_map"
-# from "path declared but the caller lacks the permission". opa-authz-proxy
-# maps the two to 404 and 403 respectively so error-page renders the right
-# message — leaking a 403 for an unknown URL would tell unauthenticated
-# scanners which paths exist.
+# from "path declared but the caller lacks the permission" or "user holds
+# the permission but is not a member of the requested organization".
+# opa-authz-proxy maps:
+#   not_found      → 404
+#   forbidden      → 403  (no matching permission)
+#   forbidden_org  → 403  (matching permission, wrong tenant)
+# error-page then renders the right message — leaking a 403 for an
+# unknown URL would tell unauthenticated scanners which paths exist.
 default decision_reason = "ok"
 
 decision_reason = "not_found" {
@@ -277,7 +334,31 @@ decision_reason = "not_found" {
   count(matching_rules) == 0
 }
 
+# Route matched, permission held, but the caller is not a member of
+# the requested organization. Only surfaces when input.organization_id
+# is present.
+decision_reason = "forbidden_org" {
+  not allow
+  count(matching_rules) > 0
+  input.organization_id
+  not tenant_ok
+  some rule in matching_rules
+  user_has_permission(rule.permission)
+}
+
 decision_reason = "forbidden" {
   not allow
   count(matching_rules) > 0
+  not decision_is_forbidden_org
+}
+
+# Helper: true when the deny is specifically the tenant gate.
+# Splitting into a dedicated rule keeps `decision_reason = "forbidden"`
+# from accidentally matching alongside `forbidden_org`.
+default decision_is_forbidden_org = false
+decision_is_forbidden_org {
+  input.organization_id
+  not tenant_ok
+  some rule in matching_rules
+  user_has_permission(rule.permission)
 }
