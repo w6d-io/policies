@@ -2,483 +2,126 @@ package rbac_test
 
 import data.rbac
 
-# ──────────────────────────────────────────────────────────────────────
-# Tests for the multi-organization (Path 3 hybrid) gate added in
-# rbac.rego.
-#
-# Tests substitute `data.bindings.*`, `data.roles.*` and
-# `data.route_map.*` individually rather than via `with data as ...`
-# on the whole document — whole-document substitution trips OPA's
-# recursion detector (https://github.com/open-policy-agent/opa/issues/4282)
-# because the compiler cannot statically prove the test rule is not
-# itself part of the replacement. Per-key substitution is the pattern
-# recommended in the OPA test docs.
-# ──────────────────────────────────────────────────────────────────────
+# ── Fixtures ─────────────────────────────────────────────────────────────────
+# jinbe owns the centralised org-user route; it carries BOTH the legacy admin
+# rule and the delegation org:manage_users rule. `settings` carries a NON-
+# management permission to exercise the org-admin capability ceiling.
+rm := {"jinbe": {"rules": [
+	{"method": "GET", "path": "/api/organizations/:organizationId/users", "permission": "admin:read"},
+	{"method": "GET", "path": "/api/organizations/:organizationId/users", "permission": "org:manage_users"},
+	{"method": "GET", "path": "/api/organizations/:organizationId/settings", "permission": "org:billing"},
+	{"method": "GET", "path": "/api/clusters", "permission": "clusters:read"},
+]}}
 
-# UUIDs used across the test cases (opaque to the policy).
-org_a := "11111111-1111-1111-1111-111111111111"
-org_b := "22222222-2222-2222-2222-222222222222"
-org_c := "33333333-3333-3333-3333-333333333333"
-
-# Shared fixture pieces. Top-level constants so the test bodies stay
-# compact, and so per-key `with data.X as fixture_X` substitution works
-# without the compiler flagging recursion.
-group_membership := {
-  "alice@example.org":    ["readers"],
-  "bob@example.org":      ["readers"],
-  "carol@example.org":    ["admins"],
-  "legacy@example.org":   ["readers"],
-  "noorg@example.org":    ["readers"],
+roles := {
+	"global": {"super_admin": ["*"]},
+	"jinbe": {"admin": ["*"], "viewer": ["databases:read"]},
+	"kuma": {"org_admin": ["org:manage_users", "users:read"], "viewer": ["read"]},
 }
 
 groups := {
-  "readers": {"jinbe": ["reader"]},
-  "admins":  {"global": ["super_admin"]},
+	"super_admins": {"global": ["super_admin"]},
+	"admins": {"jinbe": ["admin"]},
+	"kuma-org-admins": {"kuma": ["org_admin"]},
 }
 
-user_organizations := {
-  "alice@example.org": ["11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"],
-  "bob@example.org":   ["22222222-2222-2222-2222-222222222222"],
-  "carol@example.org": ["11111111-1111-1111-1111-111111111111"],
-  "noorg@example.org": [],
+gm := {
+	"super@x.io": ["super_admins"],
+	"jadmin@x.io": ["admins"],
+	"orgadmin@x.io": ["kuma-org-admins"],
+	"rosteradmin@x.io": [], # org-admin via the roster, not a group
+	"memberonly@x.io": [], # member of org_k but NOT on its roster
+	"nobody@x.io": [],
 }
 
-user_organization_primary := {
-  "legacy@example.org": "11111111-1111-1111-1111-111111111111",
+osm := {"org_k": "kuma", "org_j": "jinbe"}
+
+# rosteradmin + memberonly both belong to org_k; only rosteradmin is on its roster.
+uorg := {
+	"rosteradmin@x.io": ["org_k"],
+	"memberonly@x.io": ["org_k"],
 }
 
-roles := {
-  "global": {"super_admin": ["*"]},
-  "jinbe":  {"reader": ["clusters:read"]},
+# PER-ORG admin roster: org_k's admins = [rosteradmin]. memberonly is a member, not
+# an admin. org_j has no roster.
+oam := {"org_k": ["rosteradmin@x.io"]}
+
+decide(email, action, object) = a {
+	a := rbac.allow with input as {"email": email, "action": action, "object": object}
+		with data.route_map as rm
+		with data.roles as roles
+		with data.bindings.group_membership as gm
+		with data.bindings.groups as groups
+		with data.bindings.user_organizations as uorg
+		with data.org_service_map as osm
+		with data.org_admin_map as oam
 }
 
-route_map := {
-  "jinbe": {
-    "rules": [
-      {"method": "GET",  "path": "/api/clusters",        "permission": "clusters:read"},
-      {"method": "GET",  "path": "/api/public/health"},
-      {"method": "POST", "path": "/api/admin/users"},
-    ],
-  },
+# ── legacy per-service org-admin (via clause 4) ──────────────────────────────
+
+# kuma org admin passes the gateway for a kuma org's mgmt route (org:manage_users
+# resolved in kuma — the org's mapped service)
+test_org_admin_allowed_on_own_service_org {
+	decide("orgadmin@x.io", "GET", "/api/organizations/org_k/users")
 }
 
-# Variant for the "permission missing" decision_reason case — the
-# only declared rule needs a permission `noorg@example.org` does not hold.
-admin_only_route_map := {
-  "jinbe": {
-    "rules": [
-      {"method": "POST", "path": "/api/admin/secret", "permission": "admin:write"},
-    ],
-  },
+# ...but NOT for an org mapped to a service they don't administer (jinbe)
+test_org_admin_denied_other_service_org {
+	not decide("orgadmin@x.io", "GET", "/api/organizations/org_j/users")
 }
 
-# ──────────────────────────────────────────────────────────────────────
-# Helper: user_in_org
-# ──────────────────────────────────────────────────────────────────────
-
-test_user_in_org_multi_org_membership {
-  rbac.user_in_org("alice@example.org", org_a)
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
-
-  rbac.user_in_org("alice@example.org", org_b)
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
+# unmapped org → no service → fail closed
+test_unmapped_org_denied {
+	not decide("orgadmin@x.io", "GET", "/api/organizations/org_unmapped/users")
 }
 
-test_user_in_org_rejects_non_member {
-  not rbac.user_in_org("bob@example.org", org_a)
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
+# ── per-org admin ROSTER clause ──────────────────────────────────────────────
+
+# a user on org_k's roster reaches org_k's mgmt route
+test_roster_admin_allowed_own_org {
+	decide("rosteradmin@x.io", "GET", "/api/organizations/org_k/users")
 }
 
-test_user_in_org_unknown_email {
-  not rbac.user_in_org("ghost@example.org", org_a)
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
+# ...but NOT an org they are not on the roster for / do not belong to
+test_roster_admin_denied_other_org {
+	not decide("rosteradmin@x.io", "GET", "/api/organizations/org_j/users")
 }
 
-test_user_in_org_legacy_single_org_pointer {
-  # legacy@example.org has no entry in user_organizations but is pinned
-  # to org_a via the legacy single-org pointer — must still pass.
-  rbac.user_in_org("legacy@example.org", org_a)
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
+# PER-ORG: a plain member of org_k who is NOT on its roster is denied — membership
+# alone is not admin.
+test_member_not_on_roster_denied {
+	not decide("memberonly@x.io", "GET", "/api/organizations/org_k/users")
 }
 
-test_user_in_org_legacy_pointer_rejects_other_org {
-  not rbac.user_in_org("legacy@example.org", org_b)
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
+# the roster confers ONLY membership-management perms — a non-management route on
+# their OWN org (org:billing) is NOT granted (ceiling)
+test_roster_admin_denied_non_mgmt_perm {
+	not decide("rosteradmin@x.io", "GET", "/api/organizations/org_k/settings")
 }
 
-# ──────────────────────────────────────────────────────────────────────
-# Allow logic — super-admin wildcard bypass
-# ──────────────────────────────────────────────────────────────────────
-
-test_allow_super_admin_without_org_input {
-  rbac.allow
-    with input as {
-      "email":  "carol@example.org",
-      "object": "/api/some/random/path/never/declared",
-      "action": "GET",
-    }
-    with data.bindings.group_membership as group_membership
-    with data.bindings.groups as groups
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
-    with data.roles as roles
-    with data.route_map as route_map
+# the roster confers no service permissions at all — a non-org service route denies
+test_roster_admin_no_service_perms {
+	not decide("rosteradmin@x.io", "GET", "/api/clusters")
 }
 
-test_allow_super_admin_with_unrelated_org_id {
-  # Super-admin holds the "*" wildcard — the tenant gate is bypassed
-  # even when the request targets an org the admin is not a member of.
-  rbac.allow
-    with input as {
-      "email":           "carol@example.org",
-      "object":          "/api/clusters",
-      "action":          "GET",
-      "app":             "jinbe",
-      "organization_id": org_c,  # carol is in org_a only
-    }
-    with data.bindings.group_membership as group_membership
-    with data.bindings.groups as groups
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
-    with data.roles as roles
-    with data.route_map as route_map
+# a caller who is neither rostered nor a member is denied
+test_non_admin_denied {
+	not decide("nobody@x.io", "GET", "/api/organizations/org_k/users")
 }
 
-# ──────────────────────────────────────────────────────────────────────
-# Allow logic — tenant gate, non-admin paths
-# ──────────────────────────────────────────────────────────────────────
+# ── regressions: existing allow paths still work ────────────────────────────
 
-test_allow_when_route_permission_and_org_match {
-  rbac.allow
-    with input as {
-      "email":           "alice@example.org",
-      "object":          "/api/clusters",
-      "action":          "GET",
-      "app":             "jinbe",
-      "organization_id": org_a,
-    }
-    with data.bindings.group_membership as group_membership
-    with data.bindings.groups as groups
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
-    with data.roles as roles
-    with data.route_map as route_map
+# global super_admin bypasses via the "*" clause
+test_super_admin_allowed {
+	decide("super@x.io", "GET", "/api/organizations/org_k/users")
 }
 
-test_deny_when_route_permission_but_org_mismatch {
-  # alice holds clusters:read but is not in org_c
-  not rbac.allow
-    with input as {
-      "email":           "alice@example.org",
-      "object":          "/api/clusters",
-      "action":          "GET",
-      "app":             "jinbe",
-      "organization_id": org_c,
-    }
-    with data.bindings.group_membership as group_membership
-    with data.bindings.groups as groups
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
-    with data.roles as roles
-    with data.route_map as route_map
+# service (jinbe) admin with jinbe.admin=["*"] allowed via the "*" clause
+test_service_wildcard_admin_allowed {
+	decide("jadmin@x.io", "GET", "/api/organizations/org_k/users")
 }
 
-test_deny_when_method_does_not_match_any_rule {
-  # DELETE /api/clusters is not declared in route_map → no matching
-  # rule → falls back to `not_found` even though the user is in the
-  # org. Pins that the tenant gate doesn't accidentally allow.
-  not rbac.allow
-    with input as {
-      "email":           "alice@example.org",
-      "object":          "/api/clusters",
-      "action":          "DELETE",
-      "app":             "jinbe",
-      "organization_id": org_a,
-    }
-    with data.bindings.group_membership as group_membership
-    with data.bindings.groups as groups
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
-    with data.roles as roles
-    with data.route_map as route_map
-}
-
-# ──────────────────────────────────────────────────────────────────────
-# Allow logic — public endpoints (no permission on the rule)
-# ──────────────────────────────────────────────────────────────────────
-
-test_allow_public_route_without_org_input {
-  rbac.allow
-    with input as {
-      "email":  "noorg@example.org",
-      "object": "/api/public/health",
-      "action": "GET",
-      "app":    "jinbe",
-    }
-    with data.bindings.group_membership as group_membership
-    with data.bindings.groups as groups
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
-    with data.roles as roles
-    with data.route_map as route_map
-}
-
-test_allow_public_route_with_matching_org {
-  rbac.allow
-    with input as {
-      "email":           "alice@example.org",
-      "object":          "/api/public/health",
-      "action":          "GET",
-      "app":             "jinbe",
-      "organization_id": org_a,
-    }
-    with data.bindings.group_membership as group_membership
-    with data.bindings.groups as groups
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
-    with data.roles as roles
-    with data.route_map as route_map
-}
-
-test_deny_public_route_when_org_mismatch {
-  # Even a public route is denied if the caller is not a member of
-  # the tenant the request targets. Prevents a logged-in user of
-  # tenant A from triggering tenant B's public endpoints by spoofing
-  # X-Tenant-Id.
-  not rbac.allow
-    with input as {
-      "email":           "alice@example.org",
-      "object":          "/api/public/health",
-      "action":          "GET",
-      "app":             "jinbe",
-      "organization_id": org_c,
-    }
-    with data.bindings.group_membership as group_membership
-    with data.bindings.groups as groups
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
-    with data.roles as roles
-    with data.route_map as route_map
-}
-
-# ──────────────────────────────────────────────────────────────────────
-# Backward compatibility — no input.organization_id
-# ──────────────────────────────────────────────────────────────────────
-
-test_backcompat_no_org_input_still_allows_permission_match {
-  # Pre-multi-org callers don't send organization_id at all. The
-  # tenant gate must default to passing for these requests so
-  # existing single-tenant deployments continue to work.
-  rbac.allow
-    with input as {
-      "email":  "alice@example.org",
-      "object": "/api/clusters",
-      "action": "GET",
-      "app":    "jinbe",
-    }
-    with data.bindings.group_membership as group_membership
-    with data.bindings.groups as groups
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
-    with data.roles as roles
-    with data.route_map as route_map
-}
-
-test_backcompat_no_org_input_still_denies_unknown_route {
-  not rbac.allow
-    with input as {
-      "email":  "alice@example.org",
-      "object": "/api/does/not/exist",
-      "action": "GET",
-    }
-    with data.bindings.group_membership as group_membership
-    with data.bindings.groups as groups
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
-    with data.roles as roles
-    with data.route_map as route_map
-}
-
-# ──────────────────────────────────────────────────────────────────────
-# Legacy single-org pointer
-# ──────────────────────────────────────────────────────────────────────
-
-test_legacy_single_org_user_can_access_their_org {
-  rbac.allow
-    with input as {
-      "email":           "legacy@example.org",
-      "object":          "/api/clusters",
-      "action":          "GET",
-      "app":             "jinbe",
-      "organization_id": org_a,
-    }
-    with data.bindings.group_membership as group_membership
-    with data.bindings.groups as groups
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
-    with data.roles as roles
-    with data.route_map as route_map
-}
-
-test_legacy_single_org_user_denied_for_other_org {
-  not rbac.allow
-    with input as {
-      "email":           "legacy@example.org",
-      "object":          "/api/clusters",
-      "action":          "GET",
-      "app":             "jinbe",
-      "organization_id": org_b,
-    }
-    with data.bindings.group_membership as group_membership
-    with data.bindings.groups as groups
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
-    with data.roles as roles
-    with data.route_map as route_map
-}
-
-# ──────────────────────────────────────────────────────────────────────
-# decision_reason
-# ──────────────────────────────────────────────────────────────────────
-
-test_decision_reason_ok_on_allow {
-  rbac.decision_reason == "ok"
-    with input as {
-      "email":           "alice@example.org",
-      "object":          "/api/clusters",
-      "action":          "GET",
-      "app":             "jinbe",
-      "organization_id": org_a,
-    }
-    with data.bindings.group_membership as group_membership
-    with data.bindings.groups as groups
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
-    with data.roles as roles
-    with data.route_map as route_map
-}
-
-test_decision_reason_not_found_for_unknown_route {
-  rbac.decision_reason == "not_found"
-    with input as {
-      "email":  "alice@example.org",
-      "object": "/api/does/not/exist",
-      "action": "GET",
-    }
-    with data.bindings.group_membership as group_membership
-    with data.bindings.groups as groups
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
-    with data.roles as roles
-    with data.route_map as route_map
-}
-
-test_decision_reason_forbidden_org_when_permission_held_but_wrong_tenant {
-  rbac.decision_reason == "forbidden_org"
-    with input as {
-      "email":           "alice@example.org",
-      "object":          "/api/clusters",
-      "action":          "GET",
-      "app":             "jinbe",
-      "organization_id": org_c,
-    }
-    with data.bindings.group_membership as group_membership
-    with data.bindings.groups as groups
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
-    with data.roles as roles
-    with data.route_map as route_map
-}
-
-test_decision_reason_forbidden_when_route_matches_but_permission_missing {
-  # noorg@example.org is in `readers` (perms = clusters:read) — uses
-  # the admin-only route_map so the single declared rule needs a
-  # permission the user does not hold.
-  rbac.decision_reason == "forbidden"
-    with input as {
-      "email":  "noorg@example.org",
-      "object": "/api/admin/secret",
-      "action": "POST",
-    }
-    with data.bindings.group_membership as group_membership
-    with data.bindings.groups as groups
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
-    with data.roles as roles
-    with data.route_map as admin_only_route_map
-}
-
-# ──────────────────────────────────────────────────────────────────────
-# decision payload shape
-# ──────────────────────────────────────────────────────────────────────
-
-test_decision_payload_includes_organizations_array {
-  d := rbac.decision
-    with input as {
-      "email":           "alice@example.org",
-      "object":          "/api/clusters",
-      "action":          "GET",
-      "app":             "jinbe",
-      "organization_id": org_a,
-    }
-    with data.bindings.group_membership as group_membership
-    with data.bindings.groups as groups
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
-    with data.roles as roles
-    with data.route_map as route_map
-
-  d.allow == true
-  d.organizations == [org_a, org_b]
-  d.reason == "ok"
-  count(d.groups) == 1
-  d.groups[0] == "readers"
-}
-
-test_decision_payload_organizations_empty_when_user_has_none {
-  d := rbac.decision
-    with input as {
-      "email":  "noorg@example.org",
-      "object": "/api/public/health",
-      "action": "GET",
-      "app":    "jinbe",
-    }
-    with data.bindings.group_membership as group_membership
-    with data.bindings.groups as groups
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
-    with data.roles as roles
-    with data.route_map as route_map
-
-  d.organizations == []
-}
-
-test_decision_payload_organizations_present_even_when_denied {
-  # The proxy may want to forward X-User-Organizations on a 403 too
-  # so the SPA can re-render the org switcher. Verify the field is
-  # populated regardless of allow verdict.
-  d := rbac.decision
-    with input as {
-      "email":           "alice@example.org",
-      "object":          "/api/clusters",
-      "action":          "GET",
-      "app":             "jinbe",
-      "organization_id": org_c,
-    }
-    with data.bindings.group_membership as group_membership
-    with data.bindings.groups as groups
-    with data.bindings.user_organizations as user_organizations
-    with data.bindings.user_organization_primary as user_organization_primary
-    with data.roles as roles
-    with data.route_map as route_map
-
-  d.allow == false
-  d.reason == "forbidden_org"
-  d.organizations == [org_a, org_b]
+# unknown route → denied (no matching rule; additive clause needs a rule).
+test_unknown_route_denied {
+	not decide("nobody@x.io", "GET", "/api/nonexistent")
 }
