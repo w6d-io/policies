@@ -5,6 +5,34 @@ import future.keywords.in
 
 default allow = false
 
+# ─── 0. REQUEST PATH CANONICALIZATION (defense-in-depth vs matcher evasion) ───
+# Most-specific-wins makes an exact rule STRICTER than the catch-all that also
+# covers its path, so a caller who can tweak the path representation (trailing
+# slash, double slashes, dot-segments) could dodge the exact rule and fall
+# through to the looser wildcard. The gateway already percent-decodes (Go
+# URL.Path) and merges slashes (nginx), but the policy must NOT depend on that.
+# All matching + org-id extraction runs against a canonical form:
+#   - collapse runs of '/' into one
+#   - strip a trailing '/' (except root)
+#   - a '.'/'..' segment makes the path non-canonical → canonical_object
+#     undefined → nothing matches → not_found (fail-closed; never silently
+#     resolved to a parent path).
+# Case is intentionally NOT folded: path segments (incl. ids) are case-sensitive,
+# so upstreams must route case-sensitively too (asserted in the test suite).
+canonical_object = obj {
+  collapsed := regex.replace(input.object, "/+", "/")
+  stripped := rstrip_slash(collapsed)
+  not has_dot_segment(stripped)
+  obj := stripped
+}
+
+rstrip_slash(s) = "/" { s == "/" }
+rstrip_slash(s) = t { s != "/"; endswith(s, "/"); t := trim_suffix(s, "/") }
+rstrip_slash(s) = s { s != "/"; not endswith(s, "/") }
+
+has_dot_segment(p) { part := split(p, "/")[_]; part == "." }
+has_dot_segment(p) { part := split(p, "/")[_]; part == ".." }
+
 # ─── EFFECTIVE APP RESOLUTION ───
 # Use explicit input.app when provided (simulator, direct OPA calls).
 # Otherwise derive from route_map: find which service owns this route.
@@ -20,7 +48,7 @@ effective_app = app {
   route_config := data.route_map[app]
   some rule in route_config.rules
   rule.method == input.action
-  path_matches(rule.path, input.object)
+  path_matches(rule.path, canonical_object)
 }
 
 # ─── 1. USER ROLE AGGREGATION (per service) ───
@@ -73,13 +101,36 @@ user_permissions[perm] {
   perm := perms[_]
 }
 
-# ─── 3. REQUEST ROUTE MATCHING ───
+# ─── 3. REQUEST ROUTE MATCHING (most-specific-wins fallback) ───
+#
+# A request path can match several declared routes at once: an exact route, a
+# :param route, and a :any* catch-all can all cover the same URL. E.g.
+# /api/clusters/verify matches BOTH the exact /api/clusters/verify AND the
+# :param /api/clusters/:id. Authorizing against the UNION of those lets a caller
+# reach a path via the LOOSEST matching rule and bypass a stricter one — so we
+# rank matches by specificity and keep ONLY the most-specific tier. The looser
+# wildcard is a FALLBACK: it applies only when no more-specific rule matches.
+# Precedence, high → low:  exact  >  :param  >  :any* (suffix catch-all).
 
-matching_rules[rule] {
+# Every rule whose method + path cover the request, across all tiers.
+candidate_rules[rule] {
   route_config := data.route_map[effective_app]
   rule := route_config.rules[_]
   rule.method == input.action
-  path_matches(rule.path, input.object)
+  path_matches(rule.path, canonical_object)
+}
+
+# Specificity of the most-specific candidate. max() of the empty set is
+# undefined, so with no candidate this is undefined → matching_rules is empty →
+# decision is not_found (fail-closed; a lookup miss never yields an allow).
+best_specificity := max({route_specificity(rule.path) | some rule in candidate_rules})
+
+# The winning tier: only the most-specific matches drive allow / decision_reason.
+# Several rules at the SAME specificity (one path declared with two permission
+# rules) all stay — that is the intended OR over a single route's permissions.
+matching_rules[rule] {
+  some rule in candidate_rules
+  route_specificity(rule.path) == best_specificity
 }
 
 # ─── 4. PATH MATCHING HELPERS ───
@@ -125,6 +176,40 @@ part_matches(pattern_part, _) {
 part_matches(pattern_part, path_part) {
   not startswith(pattern_part, ":")
   pattern_part == path_part
+}
+
+# ─── 4b. ROUTE SPECIFICITY (ranks matches for most-specific-wins) ───
+# Scored from the pattern alone (path_matches already gated which patterns are
+# candidates). The three tiers sit in 1000×-separated bands so a more-specific
+# tier ALWAYS outranks a less-specific one regardless of segment counts; within
+# a tier, more literal (fixed) segments rank higher.
+#
+#   exact   no ':'            → 100000 + total segments        (finest)
+#   :param  ':' but no :any*  →  10000 + literal segment count (fixed parts win)
+#   :any*   suffix catch-all  →   1000 + literal prefix count  (deeper prefix wins)
+
+# Exact — pattern has no wildcard segment, so a match means pattern == path.
+route_specificity(pattern) = score {
+  not contains(pattern, ":")
+  score := 100000 + count(split(pattern, "/"))
+}
+
+# :param — one or more single-segment wildcards; ranked by how many segments are
+# still fixed literals (e.g. /api/clusters/:id outranks /api/:x/:y).
+route_specificity(pattern) = score {
+  contains(pattern, ":")
+  not contains(pattern, ":any*")
+  literals := count([p | some p in split(pattern, "/"); not startswith(p, ":")])
+  score := 10000 + literals
+}
+
+# :any* — suffix catch-all; ranked by prefix depth so /api/v1/:any* (deeper)
+# outranks /api/:any* (shallower) for a path both cover.
+route_specificity(pattern) = score {
+  contains(pattern, ":any*")
+  prefix := trim_suffix(trim_suffix(pattern, ":any*"), "/")
+  literals := count([p | some p in split(prefix, "/"); p != ""])
+  score := 1000 + literals
 }
 
 # ─── 5. PERMISSION CHECK ───
@@ -356,7 +441,7 @@ allow {
 allow {
   rule := matching_rules[_]
   rule.permission
-  org := org_id_from_object(input.object)
+  org := org_id_from_object(canonical_object)
   some svc in services_of(org)
   org_perms := data.rbac.user_permissions with input as {"email": input.email, "app": svc}
   perm_satisfied(org_perms, rule.permission)
@@ -374,7 +459,7 @@ allow {
 allow {
   rule := matching_rules[_]
   org_management_permission[rule.permission]
-  org := org_id_from_object(input.object)
+  org := org_id_from_object(canonical_object)
   is_org_admin_of(input.email, org)
   orgs := object.get(data.bindings.user_organizations, input.email, [])
   org == orgs[_]
@@ -409,7 +494,8 @@ perm_satisfied(perms, _) {
 matching_rules_array := [r |
   r := data.route_map[input.app].rules[_]
   r.method == input.action
-  path_matches(r.path, input.object)
+  path_matches(r.path, canonical_object)
+  route_specificity(r.path) == best_specificity
 ]
 
 default super_admin = false
